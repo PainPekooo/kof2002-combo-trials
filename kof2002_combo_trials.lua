@@ -431,6 +431,8 @@ local function parseStep(tok)
 			error("paso desconocido: " .. body)
 		end
 	end
+	-- correr y activar MAX no golpean: se dan por buenos al hacer el input
+	s.nohit = (s.m == "ff" and not s.btns) or body == "BC"
 	buildIcons(s)
 	return s
 end
@@ -502,6 +504,7 @@ local function reset()
 	T = {
 		state = "ready",    -- ready | running | finished | result
 		step = 1,
+		hitStep = 1,        -- primer paso cuyo golpe aun no conecto
 		everHit = false,
 		pending = nil,      -- frame del primer boton de un "BC" incompleto
 	}
@@ -746,11 +749,27 @@ end
 -- Logica del trial
 ----------------------------------------------------------------------------
 -- step: paso cuyo input se dibuja junto al mensaje (opcional)
-local function fail(msg, step)
+local function fail(msg, step, idx)
 	T.state, T.ok, T.msg, T.resultFrame = "result", false, msg, frame
-	T.failedStep = T.step
+	T.failedStep = idx or T.step
 	T.failIcons = step and step.icons
-	pcall(logAttempt, "TRIAL", false, "paso " .. T.step .. ": " .. msg, (T.startFrame or frame) - 20, frame)
+	pcall(logAttempt, "TRIAL", false, "paso " .. T.failedStep .. ": " .. msg, (T.startFrame or frame) - 20, frame)
+end
+
+-- un paso solo cuenta (verde) cuando su golpe conecta: cada golpe nuevo
+-- confirma el siguiente paso ya apretado, en orden
+local function skipNoHit()
+	local steps = combo().steps
+	while T.hitStep < T.step and steps[T.hitStep].nohit do T.hitStep = T.hitStep + 1 end
+end
+
+local function confirmHits(n)
+	skipNoHit()
+	for _ = 1, n do
+		if T.hitStep >= T.step then break end -- golpe extra de un paso multigolpe
+		T.hitStep = T.hitStep + 1
+		skipNoHit()
+	end
 end
 
 local function advance()
@@ -767,8 +786,9 @@ local function advance()
 	T.stepFrames[T.step] = frame
 	T.pending = nil
 	T.step = T.step + 1
+	skipNoHit()
 	if T.step > #combo().steps then
-		T.state, T.finishFrame, T.hitsAtFinish = "finished", frame, rb(ADDR.p1_hits)
+		T.state, T.finishFrame = "finished", frame
 	end
 end
 
@@ -846,29 +866,33 @@ local function updateTrial()
 	if hits < T.lastHits and not T.everHit then T.baseHits = hits end -- termino el combo anterior
 	if hits > T.baseHits then T.everHit = true end
 	local dropped = T.everHit and hits < T.lastHits -- el contador bajo: el combo se corto
+	if hits > T.lastHits then confirmHits(hits - T.lastHits) end
 	T.lastHits = hits
+	-- paso apretado que no conecto: ahi se corto el combo
+	local missed = T.hitStep < T.step and T.hitStep or nil
 
 	if T.pending and frame - T.pending > SIMUL then
 		return fail("Aprieta a la vez", combo().steps[T.step])
 	end
 
 	if dropped then
-		local s = combo().steps[T.step]
-		return fail(s and "Se corto el combo aqui" or "Se corto el combo", s)
+		local i = missed or T.step
+		local s = combo().steps[i]
+		return fail(s and "Se corto el combo aqui" or "Se corto el combo", s, i)
 	end
 	if not T.everHit and frame - T.startFrame > FIRST_HIT_MAX then
-		return fail("El primer golpe no conecto")
+		return fail("El primer golpe no conecto", combo().steps[1], 1)
 	end
 
 	if T.state == "finished" then
-		if hits > T.hitsAtFinish then
+		if T.hitStep > #combo().steps then
 			addRep()
 			T.state, T.ok, T.msg, T.resultFrame = "result", true, "LOGRADO!", frame
 			pcall(logAttempt, "TRIAL", true, "LOGRADO", T.startFrame - 20, frame)
 			learnFromSuccess()
 		elseif frame - T.finishFrame > LAST_HIT_MAX then
-			T.step = #combo().steps
-			fail("El ultimo golpe no conecto")
+			local i = missed or #combo().steps
+			fail(i == #combo().steps and "El ultimo golpe no conecto" or "Este golpe no conecto", combo().steps[i], i)
 		end
 	end
 end
@@ -932,6 +956,7 @@ local COL = {
 	title   = 0x80C0FFFF,
 	done    = 0x40FF40FF,
 	current = 0xFFFF40FF,
+	input   = 0x80C0FFFF, -- input hecho, falta que conecte el golpe
 	pending = 0xFFFFFFFF,
 	failed  = 0xFF4040FF,
 	dim     = 0xA0A0A0FF,
@@ -994,7 +1019,8 @@ end
 
 local function stepColor(i)
 	if T.state == "result" and not T.ok and i == T.failedStep then return COL.failed
-	elseif i < T.step or (T.state == "result" and T.ok) then return COL.done
+	elseif i < T.hitStep or (T.state == "result" and T.ok) then return COL.done
+	elseif i < T.step then return COL.input
 	elseif i == T.step and T.state ~= "result" then return COL.current end
 	return COL.pending
 end
@@ -1084,7 +1110,7 @@ local function draw()
 		local col = stepColor(i)
 		local ry = y + 8 + i * ROW_H
 		if col ~= COL.pending then gui.box(x - 2, ry - 2, x + 228, ry + ROW_H - 3, (col - 0xFF) + 0x30, 0) end
-		local mark = (i < T.step) and "+" or (i == T.step and ">" or " ")
+		local mark = (i < T.hitStep) and "+" or (i < T.step and "*" or (i == T.step and ">" or " "))
 		gui.text(x, ry + 2, string.format("%s%d", mark, i), col)
 		drawIcons(x + 14, ry, s.icons, col, mirror)
 		gui.text(x + 128, ry + 2, s.n, col)
